@@ -13,20 +13,21 @@ local coreGui = game:GetService("CoreGui")
 -- Constants.
 local UI_URL = "https://raw.githubusercontent.com/wspgs/Tangui.02/refs/heads/main/UI-Library0.2"
 local UPDATE_INTERVAL = 0.15
-local AUTO_PICKUP_COOLDOWN = 1.2
-local AUTO_STEP_DELAY = 0.5
-local PROMPT_RETRY_DELAY = 1.5
-local BACKOFF_MAX = 30
-local INTERACT_SETTLE = 0.3
-local MINIGAME_TIMEOUT = 8
-local MINIGAME_PRESS_DELAY = 0.45
-local MINIGAME_START_WAIT = 1.5
-local MINIGAME_MAX = 45
-local GHOST_SAFE_DISTANCE = 35
-local GHOST_WAIT_LIMIT = 10
-local EXIT_REFIRE_DELAY = 6
-local STUCK_RESET = 20
-local DATA_RETRY_DELAY = 5
+local AUTO_PICKUP_COOLDOWN = 0.3
+local AUTO_STEP_DELAY = 0.15
+local PROMPT_RETRY_DELAY = 0.4
+local BACKOFF_MAX = 3
+local INTERACT_SETTLE = 0.2
+local MINIGAME_TIMEOUT = 5
+local MINIGAME_PRESS_DELAY = 0.36
+local MINIGAME_START_WAIT = 0.35
+local MINIGAME_MAX = 20
+local GHOST_SAFE_DISTANCE = 20
+local GHOST_WAIT_LIMIT = 1.5
+local EXIT_REFIRE_DELAY = 1.2
+local STUCK_RESET = 10
+local DATA_RETRY_DELAY = 2
+local LOCK_MAX_TRIES = 12
 local DEFAULT_KEY_COLORS = { "Red", "Blue", "Green", "Yellow", "Purple" }
 
 -- Prompt name -> ESP category.
@@ -65,7 +66,6 @@ local TASK_BLACKLIST = {
 local MINIGAME_CATEGORIES = {
 	quest = true,
 	repair = true,
-	turn = true,
 }
 
 -- Toggle rows shown in the ESP tab (order matters).
@@ -104,17 +104,19 @@ local TangHub = {
 	ghostAlert = false,
 	alertDistance = 40,
 	lastAlert = 0,
-	fullbright = true,  -- เปิดสว่างเต็มจอเริ่มต้น
-	noFog = true,       -- เปิดลบหมอกเริ่มต้น
+	fullbright = false,  -- เปิดสว่างเต็มจอเริ่มต้น
+	noFog = false,       -- เปิดลบหมอกเริ่มต้น
 	instantPrompt = false,
 	reachMultiplier = 1,
-	autoPickup = false,
-	autoPickupRange = 12,
+	autoPickup = true,
+	autoPickupRange = 14,
 	infStamina = true,  -- เปิดวิ่งไม่จำกัดเริ่มต้น
-	noclip = true,      -- เปิด Noclip เริ่มต้น
-	autoFinish = true,  -- เปิดออโต้จบด่านเริ่มต้น
-	autoMinigame = false,
-	ghostAvoid = true,
+	noclip = false,      -- เปิด Noclip เริ่มต้น
+	autoFinish = false,  -- เปิดออโต้จบด่านเริ่มต้น
+	autoFarm = false,   -- ออโต้ฟาร์มวนลูป (จบแล้วเริ่มใหม่)
+	rejoining = false,
+	autoMinigame = true,
+	ghostAvoid = false,
 	questActive = nil,
 	questSession = 0,
 	questUpdated = 0,
@@ -128,6 +130,8 @@ local TangHub = {
 	lastStatusNotify = 0,
 	unsafeSince = nil,
 	escapedNotified = false,
+	legacyLockPhase = false,
+	lockTries = 0,
 	detached = false,
 }
 
@@ -231,15 +235,26 @@ end
 ---@param items table
 ---@return boolean
 local function matchesItem(prompt, items)
-	local current = prompt
+	for item in pairs(items) do
+		local lowerItem = string.lower(item)
+		if string.find(string.lower(prompt.ObjectText), lowerItem, 1, true)
+			or string.find(string.lower(prompt.ActionText), lowerItem, 1, true)
+			or string.find(string.lower(prompt.Name), lowerItem, 1, true) then
+			return true
+		end
+	end
 
+	local current = prompt
 	for _ = 1, 4 do
 		if not current or current == workspace then
-			return false
+			break
 		end
 
-		if items[string.lower(current.Name)] then
-			return true
+		local name = string.lower(current.Name)
+		for item in pairs(items) do
+			if string.find(name, string.lower(item), 1, true) then
+				return true
+			end
 		end
 
 		current = current.Parent
@@ -290,11 +305,18 @@ local function doorMatchesRoom(prompt, room)
 		return false
 	end
 
-	if string.find(string.lower(model.Name), string.lower(tostring(room)), 1, true) then
+	local roomStr = string.lower(tostring(room))
+	local modelName = string.lower(model.Name)
+	if string.find(modelName, roomStr, 1, true) then
 		return true
 	end
 
-	return model:FindFirstChild("Padlock") ~= nil
+	local parent = model.Parent
+	if parent and parent:IsA("Model") and string.find(string.lower(parent.Name), roomStr, 1, true) then
+		return true
+	end
+
+	return false
 end
 
 ---Create a billboard text tag.
@@ -619,15 +641,14 @@ function TangHub.loadQuestData()
 		return
 	end
 
-	-- Drop identity so the game module cannot see our executor environment.
-	if setthreadidentity then
-		setthreadidentity(2)
-	end
-
 	local success, data = pcall(require, module)
-
-	if setthreadidentity then
-		setthreadidentity(8)
+	if not success and setthreadidentity then
+		pcall(function()
+			setthreadidentity(2)
+			data = require(module)
+			setthreadidentity(8)
+			success = true
+		end)
 	end
 
 	if success and typeof(data) == "table" then
@@ -745,11 +766,6 @@ function TangHub.usablePrompts(hrp, predicate)
 			return
 		end
 
-		-- Drawers are one shot, never search the same one twice.
-		if key == "search" and TangHub.searched[prompt] then
-			return
-		end
-
 		if TangHub.isCoolingDown(prompt, now) then
 			return
 		end
@@ -864,7 +880,7 @@ function TangHub.questState()
 
 		-- Locked room: unlock it if we have the key, otherwise go find one.
 		local room = data.ROOMS and data.ROOMS[quest.room]
-		if room and workspace:GetAttribute("RoomLocked_" .. tostring(quest.room)) == true then
+		if room and workspace:GetAttribute("RoomLocked_" .. tostring(quest.room)) ~= false then
 			if hasKey(room.key) then
 				state.lockedRooms[quest.room] = true
 			else
@@ -879,6 +895,40 @@ function TangHub.questState()
 	end
 
 	return state
+end
+
+---Count how many padlocks remain locked (Stage 1 / Keys mode).
+---@return number
+function TangHub.padlocksLeft()
+	local padlocksFolder = workspace:FindFirstChild("Padlocks", true)
+	if padlocksFolder then
+		local count = 0
+		for _, child in ipairs(padlocksFolder:GetChildren()) do
+			if child:IsA("Model") and string.find(string.lower(child.Name), "padlock", 1, true) then
+				count = count + 1
+			end
+		end
+		return count
+	end
+
+	if workspace:GetAttribute("ObjectiveMode") == "Keys" then
+		local count = 0
+		local hasAny = false
+		for _, color in ipairs(TangHub.getKeyColors()) do
+			local attr = workspace:GetAttribute(color .. "Unlocked")
+			if attr ~= nil then
+				hasAny = true
+				if attr ~= true then
+					count = count + 1
+				end
+			end
+		end
+		if hasAny then
+			return count
+		end
+	end
+
+	return 0
 end
 
 ---Check whether a lock can be opened right now.
@@ -903,9 +953,9 @@ local function lockReady(prompt, searchesLeft)
 		return false
 	end
 
-	-- Single gate lock: wait for every key unless there is nothing left to search.
+	-- Gate lock or Loading Dock lift lock: unlock if we are holding any keys
 	local held = TangHub.countKeys()
-	return held >= #colors or (held > 0 and not searchesLeft)
+	return held > 0
 end
 
 ---Pick any harmless prompt as a fallback.
@@ -929,35 +979,51 @@ function TangHub.pickKeysTarget(hrp)
 		return key == "search"
 	end)
 
-	local locks = TangHub.usablePrompts(hrp, function(prompt, key)
-		if not (key == "lock" or isLockPrompt(prompt)) then
-			return false
+	local heldKeys = TangHub.countKeys()
+
+	-- 1. If holding keys, unlock lift locks or padlocks immediately
+	if heldKeys > 0 then
+		local locks = TangHub.usablePrompts(hrp, function(prompt, key)
+			return (key == "lock" or isLockPrompt(prompt)) and lockReady(prompt, #searches > 0)
+		end)
+		local lockTarget = TangHub.chooseNearest(locks)
+		if lockTarget then
+			TangHub.setStatus("ปลดล็อกทางออก")
+			return lockTarget
 		end
 
-		return lockReady(prompt, #searches > 0)
+		-- In Stage 1: Padlocks are on ExitDoor, and ExitPrompt is used to unlock them!
+		if TangHub.padlocksLeft() > 0 then
+			local exitPrompt = TangHub.findPrompt("exit")
+			if exitPrompt and exitPrompt.Enabled then
+				TangHub.setStatus("ไขแม่กุญแจที่ประตูทางออก")
+				return exitPrompt
+			end
+		end
+	end
+
+	-- 2. Pick up loose items (14 lost items, dropped keys)
+	local pickups = TangHub.usablePrompts(hrp, function(_, key)
+		return key == "pickup"
 	end)
-
-	local target = TangHub.chooseNearest(locks)
-	if target then
-		TangHub.setStatus("ปลดล็อกทางออก")
-		return target
+	local pickupTarget = TangHub.chooseNearest(pickups)
+	if pickupTarget then
+		TangHub.setStatus("เก็บไอเทม")
+		return pickupTarget
 	end
 
-	target = TangHub.chooseNearest(searches)
-	if target then
-		TangHub.setStatus("ค้นหากุญแจ")
-		return target
+	-- 3. Search drawers for keys (5 keys)
+	local searchTarget = TangHub.chooseNearest(searches)
+	if searchTarget then
+		TangHub.setStatus("ค้นหากุญแจในลิ้นชัก")
+		return searchTarget
 	end
 
-	-- Keys in hand but no lock prompt: some maps unlock the padlocks through the exit prompt.
-	if TangHub.countKeys() > 0 then
-		target = TangHub.chooseNearest(TangHub.usablePrompts(hrp, function(_, key)
-			return key == "exit"
-		end))
-
-		if target then
-			TangHub.setStatus("ใส่กุญแจ")
-			return target
+	-- 4. Fallback if drawers are checked but padlocks remain
+	if TangHub.padlocksLeft() > 0 and heldKeys > 0 then
+		local exitPrompt = TangHub.findPrompt("exit")
+		if exitPrompt and exitPrompt.Enabled then
+			return exitPrompt
 		end
 	end
 
@@ -976,6 +1042,17 @@ function TangHub.pickQuestTarget(hrp)
 	if state.pending == 0 and needed and (workspace:GetAttribute("QuestsDone") or 0) >= needed then
 		TangHub.setStatus("เควสต์ครบ รอคันโยก")
 		return nil
+	end
+
+	-- 1. If holding keys, check if there are locks (lift locks, gate locks) or doors
+	if TangHub.countKeys() > 0 then
+		local lock = TangHub.chooseNearest(TangHub.usablePrompts(hrp, function(prompt, key)
+			return (key == "lock" or isLockPrompt(prompt)) and lockReady(prompt, true)
+		end))
+		if lock then
+			TangHub.setStatus("ปลดล็อกทางออก")
+			return lock
+		end
 	end
 
 	-- Open locked rooms we already hold the key for.
@@ -1012,21 +1089,26 @@ function TangHub.pickQuestTarget(hrp)
 		end
 	end
 
-	-- Missing items or keys can come from drawers.
-	if state.missingKey or next(state.items) then
-		target = TangHub.chooseNearest(TangHub.usablePrompts(hrp, function(_, key)
-			return key == "search"
-		end))
-
-		if target then
-			TangHub.setStatus("ค้นหาไอเทม/กุญแจ")
-			return target
-		end
+	-- Pick up any loose items (e.g. lost items in Stage 2)
+	local pickup = TangHub.chooseNearest(TangHub.usablePrompts(hrp, function(_, key)
+		return key == "pickup"
+	end))
+	if pickup then
+		TangHub.setStatus("เก็บไอเทม")
+		return pickup
 	end
 
 	-- Quest sites (repair minigames, valves, fuse boxes), prefer the ones tied to a pending quest.
 	local sites = TangHub.usablePrompts(hrp, function(prompt, key)
-		if key == "quest" or key == "turn" then
+		if key == "turn" then
+			-- If valve belongs to the valve puzzle, solveValves handles it in exact order
+			if prompt:FindFirstAncestor("Valves") then
+				return false
+			end
+			return true
+		end
+
+		if key == "quest" then
 			return true
 		end
 
@@ -1050,14 +1132,92 @@ function TangHub.pickQuestTarget(hrp)
 		return target
 	end
 
-	-- Last resort: drawers, then loose items.
-	target = TangHub.chooseNearest(TangHub.usablePrompts(hrp, function(_, key)
+	-- Search drawers for keys / items
+	local search = TangHub.chooseNearest(TangHub.usablePrompts(hrp, function(_, key)
 		return key == "search"
 	end))
+	if search then
+		TangHub.setStatus("ค้นหาลิ้นชัก")
+		return search
+	end
 
-	return target or TangHub.chooseNearest(TangHub.usablePrompts(hrp, function(_, key)
+	return TangHub.pickAnything(hrp)
+end
+
+---Universal target picker for Stage 2, Stage 3 and unknown modes.
+---@param hrp BasePart
+---@return ProximityPrompt?
+function TangHub.pickUniversalTarget(hrp)
+	local searches = TangHub.usablePrompts(hrp, function(_, key)
+		return key == "search"
+	end)
+
+	-- 1. If holding keys, unlock locks (lift locks / padlocks) or doors first.
+	if TangHub.countKeys() > 0 then
+		local lock = TangHub.chooseNearest(TangHub.usablePrompts(hrp, function(prompt, key)
+			return (key == "lock" or isLockPrompt(prompt)) and lockReady(prompt, #searches > 0)
+		end))
+		if lock then
+			TangHub.setStatus("ปลดล็อกทางออก")
+			return lock
+		end
+
+		if TangHub.padlocksLeft() > 0 then
+			local exitPrompt = TangHub.findPrompt("exit")
+			if exitPrompt and exitPrompt.Enabled then
+				TangHub.setStatus("ไขแม่กุญแจที่ประตูทางออก")
+				return exitPrompt
+			end
+		end
+
+		local door = TangHub.chooseNearest(TangHub.usablePrompts(hrp, function(_, key)
+			return key == "door"
+		end))
+		if door then
+			TangHub.setStatus("เปิดประตู")
+			return door
+		end
+	end
+
+	-- 2. Pick up loose items or keys (lost items 0/14)
+	local pickup = TangHub.chooseNearest(TangHub.usablePrompts(hrp, function(_, key)
 		return key == "pickup"
-	end)) or TangHub.pickAnything(hrp)
+	end))
+	if pickup then
+		TangHub.setStatus("เก็บไอเทม")
+		return pickup
+	end
+
+	-- 3. Search drawers/cabinets for keys (0/5)
+	local search = TangHub.chooseNearest(searches)
+	if search then
+		TangHub.setStatus("ค้นหากุญแจในลิ้นชัก")
+		return search
+	end
+
+	-- 4. Quest / Repair / Turn sites
+	local site = TangHub.chooseNearest(TangHub.usablePrompts(hrp, function(prompt, key)
+		if key == "turn" then
+			if prompt:FindFirstAncestor("Valves") then
+				return false
+			end
+			return true
+		end
+		if key == "quest" then
+			return true
+		end
+		if key == "repair" then
+			return not isGeneratorPrompt(prompt) or workspace:GetAttribute("PowerOn") == false
+		end
+		return false
+	end))
+	if site then
+		TangHub.setStatus("ทำภารกิจ")
+		return site
+	end
+
+	-- 5. Fallback to anything safe
+	return TangHub.pickAnything(hrp)
 end
 
 ---Teleport next to a prompt and trigger it.
@@ -1081,7 +1241,10 @@ function TangHub.interact(prompt, hrp)
 		prompt.HoldDuration = 0
 	end
 
-	local fired = pcall(fireproximityprompt, prompt)
+	local fired = pcall(fireproximityprompt, prompt, 0)
+	if not fired then
+		fired = pcall(fireproximityprompt, prompt)
+	end
 	if not fired then
 		pcall(function()
 			prompt:InputHoldBegin()
@@ -1110,12 +1273,12 @@ function TangHub.waitMinigame(expectStart)
 
 	local waited = os.clock()
 	while expectStart and not TangHub.questActive and os.clock() - waited < MINIGAME_START_WAIT do
-		task.wait(0.1)
+		task.wait(0.04)
 	end
 
 	local running = os.clock()
 	while TangHub.questActive and not TangHub.detached and os.clock() - running < MINIGAME_MAX do
-		task.wait(0.2)
+		task.wait(0.08)
 	end
 end
 
@@ -1130,10 +1293,6 @@ function TangHub.runPrompt(prompt, hrp)
 		return
 	end
 
-	if key == "search" then
-		TangHub.searched[prompt] = true
-	end
-
 	TangHub.waitMinigame(MINIGAME_CATEGORIES[key] == true)
 end
 
@@ -1146,6 +1305,18 @@ function TangHub.findEscapeZone()
 	end
 
 	zone = workspace:FindFirstChild("EscapeZone", true)
+	if not zone then
+		local escapeRoute = workspace:FindFirstChild("EscapeRoute", true)
+		if escapeRoute then
+			zone = escapeRoute:FindFirstChild("EscapeZone", true) or escapeRoute:FindFirstChildWhichIsA("BasePart", true)
+		end
+	end
+	if not zone then
+		local exitDoor = workspace:FindFirstChild("ExitDoor", true) or workspace:FindFirstChild("OutfallGate", true)
+		if exitDoor then
+			zone = exitDoor:FindFirstChildWhichIsA("BasePart", true)
+		end
+	end
 	TangHub.escapeZone = zone
 	return zone
 end
@@ -1155,33 +1326,161 @@ end
 function TangHub.escapeStep(hrp)
 	local now = os.clock()
 
-	-- Fire the exit prompt first (once per delay window).
+	-- Fire the exit prompt if available (e.g. lift call / door release)
 	local exitPrompt = TangHub.findPrompt("exit")
-	if exitPrompt and now - TangHub.exitFiredAt > EXIT_REFIRE_DELAY then
+	if exitPrompt and exitPrompt.Enabled and now - TangHub.exitFiredAt > EXIT_REFIRE_DELAY then
 		TangHub.exitFiredAt = now
 		TangHub.interact(exitPrompt, hrp)
-		return
 	end
 
-	-- Then stand inside the escape zone until the game marks us as escaped.
+	-- Stand inside the escape zone until the game marks us as escaped.
 	local zone = TangHub.findEscapeZone()
-	if not zone then
-		return
+	if zone then
+		hrp.CFrame = zone.CFrame + Vector3.new(0, 1.5, 0)
+		hrp.AssemblyLinearVelocity = Vector3.zero
+
+		local head = hrp.Parent and hrp.Parent:FindFirstChild("Head")
+		for _, part in ipairs({ hrp, head }) do
+			pcall(firetouchinterest, part, zone, 0)
+			task.wait(0.04)
+			pcall(firetouchinterest, part, zone, 1)
+		end
+	elseif exitPrompt then
+		local pos = getPromptPosition(exitPrompt)
+		if pos then
+			hrp.CFrame = CFrame.new(pos + Vector3.new(0, 1, 4))
+			hrp.AssemblyLinearVelocity = Vector3.zero
+		end
+	end
+end
+
+---Read the required valve sequence from the OrderBoard.
+---@return table?
+local function getValveOrder()
+	local orderBoard = workspace:FindFirstChild("OrderBoard", true)
+	if orderBoard then
+		local surfaceGui = orderBoard:FindFirstChildOfClass("SurfaceGui") or orderBoard:FindFirstChildWhichIsA("SurfaceGui", true)
+		local label = surfaceGui and (surfaceGui:FindFirstChild("Order") or surfaceGui:FindFirstChildOfClass("TextLabel"))
+		if label and label.Text ~= "" then
+			local order = {}
+			for num in string.gmatch(label.Text, "%d+") do
+				table.insert(order, tonumber(num))
+			end
+			if #order >= 2 then
+				return order
+			end
+		end
 	end
 
-	hrp.CFrame = zone.CFrame
-	hrp.AssemblyLinearVelocity = Vector3.zero
-
-	local head = hrp.Parent and hrp.Parent:FindFirstChild("Head")
-	for _, part in ipairs({ hrp, head }) do
-		pcall(firetouchinterest, part, zone, 0)
+	local attr = workspace:GetAttribute("ValveOrder") or workspace:GetAttribute("Order")
+	if typeof(attr) == "string" then
+		local order = {}
+		for num in string.gmatch(attr, "%d+") do
+			table.insert(order, tonumber(num))
+		end
+		if #order >= 2 then
+			return order
+		end
 	end
 
-	task.wait(0.2)
+	return nil
+end
 
-	for _, part in ipairs({ hrp, head }) do
-		pcall(firetouchinterest, part, zone, 1)
+---Solve the valve order puzzle in exact sequence.
+---@param hrp BasePart
+---@return boolean
+function TangHub.solveValves(hrp)
+	local order = getValveOrder()
+	if not order or #order == 0 then
+		return false
 	end
+
+	local valvesModel = workspace:FindFirstChild("Valves", true)
+	if not valvesModel then
+		return false
+	end
+
+	-- Check if valves have TurnPrompt enabled
+	local valvePrompts = {}
+	local allEnabled = true
+
+	for _, num in ipairs(order) do
+		local valve = valvesModel:FindFirstChild("Valve" .. tostring(num))
+		local prompt = valve and valve:FindFirstChildWhichIsA("ProximityPrompt", true)
+		if prompt and prompt.Enabled then
+			valvePrompts[num] = prompt
+		else
+			allEnabled = false
+			break
+		end
+	end
+
+	-- If not all prompts exist and are enabled, puzzle might already be solved
+	if not allEnabled or #order == 0 then
+		return false
+	end
+
+	TangHub.setStatus("หมุนวาล์ว: " .. table.concat(order, " -> "))
+
+	-- Turn each valve in the exact required sequence
+	for _, num in ipairs(order) do
+		local prompt = valvePrompts[num]
+		if prompt and prompt.Enabled then
+			TangHub.interact(prompt, hrp)
+			task.wait(0.35)
+		end
+	end
+
+	return true
+end
+
+---Check if the round is complete and the escape exit is ready.
+---@param hrp BasePart
+---@return boolean
+function TangHub.isExitReady(hrp)
+	if workspace:GetAttribute("ExitOpen") then
+		return true
+	end
+
+	if workspace:GetAttribute("LeverArmed") and not TangHub.findPrompt("lever") then
+		return true
+	end
+
+	-- In Stage 1: If all padlocks are unlocked, exit is ready!
+	local padlocksCount = TangHub.padlocksLeft()
+	if padlocksCount == 0 and workspace:FindFirstChild("Padlocks", true) then
+		local exitPrompt = TangHub.findPrompt("exit")
+		if exitPrompt or TangHub.findEscapeZone() then
+			return true
+		end
+	end
+
+	-- ExitPrompt enabled and no locks remain
+	local locks = TangHub.usablePrompts(hrp, function(p, k)
+		return k == "lock" or isLockPrompt(p)
+	end)
+
+	local exitPrompt = TangHub.findPrompt("exit")
+	if exitPrompt and exitPrompt.Enabled and #locks == 0 and padlocksCount == 0 then
+		return true
+	end
+
+	-- If all locks, padlocks, pickups and searches are done, exit is ready!
+	local pickups = TangHub.usablePrompts(hrp, function(_, k)
+		return k == "pickup"
+	end)
+	local searches = TangHub.usablePrompts(hrp, function(_, k)
+		return k == "search"
+	end)
+	local quests = TangHub.usablePrompts(hrp, function(p, k)
+		return (k == "quest" or k == "repair") and not isGeneratorPrompt(p)
+	end)
+
+	if #locks == 0 and padlocksCount == 0 and #pickups == 0 and #searches == 0 and #quests == 0 and (exitPrompt or TangHub.findEscapeZone()) then
+		return true
+	end
+
+	return false
 end
 
 ---One step of the auto finish state machine (follows the game's objective order).
@@ -1193,11 +1492,38 @@ function TangHub.autoFinishStep()
 				TangHub.window:notify({ Title = "Tang Hub", Text = "ออกจากด่านสำเร็จ!", Duration = 5 })
 			end
 		end
+
+		if TangHub.autoFarm and not TangHub.rejoining then
+			TangHub.rejoining = true
+			task.spawn(function()
+				task.wait(2.5)
+				local remotes = replicatedStorage:FindFirstChild("HorrorRemotes")
+				local spectateAction = remotes and remotes:FindFirstChild("SpectateAction")
+				if spectateAction then
+					spectateAction:FireServer("lobby")
+				end
+				task.wait(4)
+				TangHub.rejoining = false
+			end)
+		end
 		return
 	end
 	TangHub.escapedNotified = false
 
 	if localPlayer:GetAttribute("Defeated") or localPlayer:GetAttribute("Spectating") then
+		if TangHub.autoFarm and not TangHub.rejoining then
+			TangHub.rejoining = true
+			task.spawn(function()
+				task.wait(2)
+				local remotes = replicatedStorage:FindFirstChild("HorrorRemotes")
+				local spectateAction = remotes and remotes:FindFirstChild("SpectateAction")
+				if spectateAction then
+					spectateAction:FireServer("lobby")
+				end
+				task.wait(4)
+				TangHub.rejoining = false
+			end)
+		end
 		return
 	end
 
@@ -1223,12 +1549,14 @@ function TangHub.autoFinishStep()
 	if signature ~= TangHub.lastSignature then
 		TangHub.lastSignature = signature
 		TangHub.lastProgress = os.clock()
+		TangHub.lockTries = 0
 		table.clear(TangHub.attempts)
 	end
 
 	-- Nothing changed for a long time, retry everything including drawers.
 	if os.clock() - TangHub.lastProgress > STUCK_RESET then
 		TangHub.lastProgress = os.clock()
+		TangHub.lockTries = 0
 		table.clear(TangHub.attempts)
 		table.clear(TangHub.searched)
 	end
@@ -1237,7 +1565,7 @@ function TangHub.autoFinishStep()
 	local hasQuests = (workspace:GetAttribute("Quests") or "") ~= ""
 	local target = nil
 
-	-- Blackout: restart the generator first.
+	-- 1. Blackout: restart the generator first.
 	if workspace:GetAttribute("PowerOn") == false then
 		target = TangHub.findPrompt("repair", "GeneratorRoom")
 		if target then
@@ -1246,13 +1574,18 @@ function TangHub.autoFinishStep()
 		end
 	end
 
-	-- Gate is open: leave the level.
-	if workspace:GetAttribute("ExitOpen") then
+	-- 2. Valve Puzzle (Stage 2/3): solve valves in exact order
+	if TangHub.solveValves(hrp) then
+		return
+	end
+
+	-- 3. Gate / Lift is open: leave the level.
+	if TangHub.isExitReady(hrp) then
 		TangHub.setStatus("ออกจากด่าน")
 		return TangHub.escapeStep(hrp)
 	end
 
-	-- Everything is done, pull the release lever.
+	-- 4. Everything is done, pull the release lever.
 	if workspace:GetAttribute("LeverArmed") then
 		target = TangHub.findPrompt("lever")
 		if target then
@@ -1264,16 +1597,13 @@ function TangHub.autoFinishStep()
 		return TangHub.escapeStep(hrp)
 	end
 
-	-- Round has not started yet.
-	if mode ~= "Keys" and not hasQuests then
-		TangHub.setStatus("รอเริ่มรอบ")
-		return
-	end
-
+	-- 5. Standard gameplay (Keys mode, Quest mode, or Universal mode)
 	if mode == "Keys" then
 		target = TangHub.pickKeysTarget(hrp)
-	else
+	elseif hasQuests then
 		target = TangHub.pickQuestTarget(hrp)
+	else
+		target = TangHub.pickUniversalTarget(hrp)
 	end
 
 	if target then
@@ -1303,7 +1633,7 @@ function TangHub.onQuestEvent(action, questId)
 		return
 	end
 
-	if action == "start" then
+	if action == "start" or action == "progress" then
 		TangHub.questSession = TangHub.questSession + 1
 		local session = TangHub.questSession
 
@@ -1311,8 +1641,11 @@ function TangHub.onQuestEvent(action, questId)
 		TangHub.questUpdated = os.clock()
 
 		task.spawn(function()
+			if TangHub.questRemote then
+				TangHub.questRemote:FireServer("press", questId, true)
+			end
+
 			while TangHub.questSession == session and TangHub.questActive == questId and not TangHub.detached do
-				-- The server stopped answering, release the minigame.
 				if os.clock() - TangHub.questUpdated > MINIGAME_TIMEOUT then
 					pcall(TangHub.questRemote.FireServer, TangHub.questRemote, "stop", questId)
 					break
@@ -1337,7 +1670,7 @@ function TangHub.onQuestEvent(action, questId)
 		return
 	end
 
-	if action == "progress" or action == "miss" then
+	if action == "miss" then
 		TangHub.questUpdated = os.clock()
 		return
 	end
@@ -1497,11 +1830,20 @@ function TangHub.buildMenu(Library)
 		Callback = function(state)
 			TangHub.autoFinish = state
 			TangHub.lastProgress = os.clock()
+			TangHub.legacyLockPhase = false
+			TangHub.lockTries = 0
 			table.clear(TangHub.attempts)
 			table.clear(TangHub.searched)
 			if not state then
 				TangHub.questActive = nil
 			end
+		end,
+	})
+	autoTab:addToggle({
+		Name = "ออโต้ฟาร์มวนลูป (จบด่านแล้วกลับล็อบบี้)",
+		Default = false,
+		Callback = function(state)
+			TangHub.autoFarm = state
 		end,
 	})
 	autoTab:addToggle({
@@ -1633,6 +1975,8 @@ function TangHub.start()
 	-- Re-apply the stamina flag after every respawn.
 	table.insert(TangHub.connections, localPlayer.CharacterAdded:Connect(function()
 		TangHub.questActive = nil
+		TangHub.legacyLockPhase = false
+		TangHub.lockTries = 0
 		task.defer(TangHub.updateStamina)
 	end))
 
