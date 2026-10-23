@@ -1,0 +1,1455 @@
+-- Check for table that is shared between executions.
+if not shared then
+	return warn("No shared, no script.")
+end
+
+-- Services.
+local playersService = game:GetService("Players")
+local runService = game:GetService("RunService")
+local lightingService = game:GetService("Lighting")
+local replicatedStorage = game:GetService("ReplicatedStorage")
+local coreGui = game:GetService("CoreGui")
+
+-- Constants.
+local UI_URL = "https://raw.githubusercontent.com/wspgs/Tangui.02/refs/heads/main/UI-Library0.2"
+local UPDATE_INTERVAL = 0.15
+local AUTO_PICKUP_COOLDOWN = 1.2
+local AUTO_STEP_DELAY = 0.6
+local PROMPT_RETRY_DELAY = 1.5
+local MAX_PROMPT_ATTEMPTS = 5
+local ATTEMPT_RESET = 25
+local MINIGAME_TIMEOUT = 8
+local MINIGAME_PRESS_DELAY = 0.45
+local GHOST_SAFE_DISTANCE = 35
+local GHOST_WAIT_LIMIT = 10
+local EXIT_REFIRE_DELAY = 6
+local STUCK_RESET = 20
+local DEFAULT_KEY_COLORS = { "Red", "Blue", "Green", "Yellow", "Purple" }
+
+-- Prompt name -> ESP category.
+local PROMPT_CATEGORIES = {
+	ExitPrompt = { key = "exit", label = "ทางออก", color = Color3.fromRGB(80, 255, 120) },
+	LockPrompt = { key = "lock", label = "ล็อกทางออก", color = Color3.fromRGB(255, 80, 80) },
+	DoorPrompt = { key = "door", label = "ประตู", color = Color3.fromRGB(255, 200, 90) },
+	LeverPrompt = { key = "lever", label = "คันโยก", color = Color3.fromRGB(255, 140, 60) },
+	PickupPrompt = { key = "pickup", label = "ไอเทม/กุญแจ", color = Color3.fromRGB(255, 235, 70) },
+	QuestPrompt = { key = "quest", label = "เควสต์", color = Color3.fromRGB(90, 200, 255) },
+	RepairPrompt = { key = "repair", label = "จุดซ่อม", color = Color3.fromRGB(200, 120, 255) },
+	TurnPrompt = { key = "turn", label = "วาล์ว/ล้อหมุน", color = Color3.fromRGB(120, 160, 255) },
+	HidePrompt = { key = "hide", label = "ที่ซ่อนตัว", color = Color3.fromRGB(170, 170, 170) },
+	SearchPrompt = { key = "search", label = "จุดค้นหา", color = Color3.fromRGB(255, 255, 255) },
+	PrankPrompt = { key = "prank", label = "จุดแกล้ง", color = Color3.fromRGB(255, 120, 200) },
+	DrinkPrompt = { key = "drink", label = "เครื่องดื่ม", color = Color3.fromRGB(120, 255, 230) },
+}
+
+-- Model name -> ESP category.
+local MODEL_CATEGORIES = {
+	Padlock = { key = "padlock", label = "แม่กุญแจ", color = Color3.fromRGB(255, 80, 80) },
+	YellowPadlock = { key = "padlock", label = "แม่กุญแจเหลือง", color = Color3.fromRGB(255, 80, 80) },
+}
+
+-- Prompt categories the fallback auto finish must never touch.
+local TASK_BLACKLIST = {
+	hide = true,
+	prank = true,
+	drink = true,
+	lever = true,
+	exit = true,
+	door = true,
+}
+
+-- Toggle rows shown in the ESP tab (order matters).
+local ESP_TOGGLES = {
+	{ key = "exit", name = "ESP ทางออก", default = true },
+	{ key = "lock", name = "ESP ล็อกทางออก", default = true },
+	{ key = "pickup", name = "ESP ไอเทม / กุญแจ", default = true },
+	{ key = "padlock", name = "ESP แม่กุญแจ", default = true },
+	{ key = "lever", name = "ESP คันโยก", default = true },
+	{ key = "quest", name = "ESP เควสต์", default = true },
+	{ key = "repair", name = "ESP จุดซ่อม", default = true },
+	{ key = "turn", name = "ESP วาล์ว / ล้อหมุน", default = true },
+	{ key = "door", name = "ESP ประตู", default = false },
+	{ key = "hide", name = "ESP ที่ซ่อนตัว", default = false },
+	{ key = "search", name = "ESP จุดค้นหา", default = false },
+	{ key = "prank", name = "ESP จุดแกล้ง", default = false },
+	{ key = "drink", name = "ESP เครื่องดื่ม", default = false },
+}
+
+local GHOST_COLOR = Color3.fromRGB(255, 40, 40)
+local PLAYER_COLOR = Color3.fromRGB(80, 170, 255)
+
+local TangHub = {
+	tags = {},
+	playerTags = {},
+	promptCache = setmetatable({}, { __mode = "k" }),
+	pickupTimes = setmetatable({}, { __mode = "k" }),
+	otherPrompts = setmetatable({}, { __mode = "k" }),
+	attempts = setmetatable({}, { __mode = "k" }),
+	noclipParts = setmetatable({}, { __mode = "k" }),
+	connections = {},
+	toggles = {},
+	enabled = {},
+	maxDistance = 600,
+	ghostAlert = false,
+	alertDistance = 40,
+	lastAlert = 0,
+	fullbright = false,
+	noFog = false,
+	instantPrompt = false,
+	reachMultiplier = 1,
+	autoPickup = false,
+	autoPickupRange = 12,
+	infStamina = false,
+	noclip = false,
+	autoFinish = false,
+	autoMinigame = false,
+	ghostAvoid = true,
+	questActive = nil,
+	questUpdated = 0,
+	questData = nil,
+	escapeZone = nil,
+	exitFiredAt = 0,
+	lastAction = 0,
+	unsafeSince = nil,
+	escapedNotified = false,
+	detached = false,
+}
+
+-- Local player and folder holding every ESP instance.
+local localPlayer = playersService.LocalPlayer
+local espFolder = Instance.new("Folder")
+espFolder.Name = "TangHubESP"
+
+local folderParented = pcall(function()
+	espFolder.Parent = gethui()
+end)
+if not folderParented then
+	espFolder.Parent = coreGui
+end
+
+-- Original lighting values for restore.
+local originalLighting = {
+	Brightness = lightingService.Brightness,
+	ClockTime = lightingService.ClockTime,
+	FogEnd = lightingService.FogEnd,
+	FogStart = lightingService.FogStart,
+	GlobalShadows = lightingService.GlobalShadows,
+	Ambient = lightingService.Ambient,
+}
+
+---Find a part to attach ESP to.
+---@param model Model
+---@return BasePart?
+local function findRoot(model)
+	return model.PrimaryPart or model:FindFirstChild("HumanoidRootPart") or model:FindFirstChildWhichIsA("BasePart", true)
+end
+
+---Get the world position of a prompt.
+---@param prompt ProximityPrompt
+---@return Vector3?
+local function getPromptPosition(prompt)
+	local parent = prompt.Parent
+	if not parent then
+		return nil
+	end
+
+	if parent:IsA("Attachment") then
+		return parent.WorldPosition
+	end
+
+	if parent:IsA("BasePart") then
+		return parent.Position
+	end
+
+	local root = parent:IsA("Model") and findRoot(parent) or parent:FindFirstChildWhichIsA("BasePart", true)
+	return root and root.Position or nil
+end
+
+---Lowercase names of the first few ancestors of an instance, joined with spaces.
+---@param instance Instance
+---@return string
+local function getAncestorNames(instance)
+	local names = {}
+	local current = instance.Parent
+
+	for _ = 1, 4 do
+		if not current or current == workspace then
+			break
+		end
+
+		table.insert(names, string.lower(current.Name))
+		current = current.Parent
+	end
+
+	return table.concat(names, " ")
+end
+
+---Check whether the local player holds a key of the given color.
+---@param color string
+---@return boolean
+local function hasKey(color)
+	return localPlayer:GetAttribute("Has" .. tostring(color) .. "Key") == true
+end
+
+---Check whether a prompt belongs to a lock or padlock.
+---@param prompt ProximityPrompt
+---@return boolean
+local function isLockPrompt(prompt)
+	if string.find(string.lower(prompt.Name), "lock", 1, true) then
+		return true
+	end
+
+	local names = getAncestorNames(prompt)
+	return string.find(names, "padlock", 1, true) ~= nil or string.find(names, "heavylock", 1, true) ~= nil
+end
+
+---Check whether a prompt belongs to the generator room.
+---@param prompt ProximityPrompt
+---@return boolean
+local function isGeneratorPrompt(prompt)
+	return string.find(prompt:GetFullName(), "GeneratorRoom", 1, true) ~= nil
+end
+
+---Create a billboard text tag.
+---@param adornee BasePart
+---@param color Color3
+---@return BillboardGui, TextLabel
+local function createBillboard(adornee, color)
+	local gui = Instance.new("BillboardGui")
+	gui.AlwaysOnTop = true
+	gui.Size = UDim2.fromOffset(160, 26)
+	gui.StudsOffset = Vector3.new(0, 1.5, 0)
+	gui.MaxDistance = math.huge
+	gui.Adornee = adornee
+	gui.Enabled = false
+	gui.Parent = espFolder
+
+	local label = Instance.new("TextLabel")
+	label.BackgroundTransparency = 1
+	label.Size = UDim2.fromScale(1, 1)
+	label.Font = Enum.Font.GothamBold
+	label.TextSize = 13
+	label.TextColor3 = color
+	label.TextStrokeTransparency = 0.3
+	label.Parent = gui
+
+	return gui, label
+end
+
+---Apply hold / reach modifications to a prompt.
+---@param prompt ProximityPrompt
+function TangHub.applyPrompt(prompt)
+	local cache = TangHub.promptCache[prompt]
+	if not cache then
+		cache = { hold = prompt.HoldDuration, distance = prompt.MaxActivationDistance }
+		TangHub.promptCache[prompt] = cache
+	end
+
+	prompt.HoldDuration = TangHub.instantPrompt and 0 or cache.hold
+	prompt.MaxActivationDistance = cache.distance * TangHub.reachMultiplier
+end
+
+---Re-apply prompt modifications on every known prompt.
+function TangHub.applyAllPrompts()
+	for _, descendant in ipairs(workspace:GetDescendants()) do
+		if descendant:IsA("ProximityPrompt") then
+			TangHub.applyPrompt(descendant)
+		end
+	end
+end
+
+---Register an instance for ESP if it matches a category.
+---@param instance Instance
+function TangHub.register(instance)
+	if TangHub.tags[instance] then
+		return
+	end
+
+	if instance:IsA("ProximityPrompt") then
+		TangHub.applyPrompt(instance)
+
+		local category = PROMPT_CATEGORIES[instance.Name]
+		if not category then
+			-- Unknown prompts (padlocks, gate parts) are still used by auto finish.
+			TangHub.otherPrompts[instance] = true
+			return
+		end
+
+		local adornee = instance.Parent
+		if adornee and not adornee:IsA("BasePart") then
+			adornee = adornee:IsA("Model") and findRoot(adornee) or adornee:FindFirstChildWhichIsA("BasePart", true)
+		end
+		if not adornee then
+			return
+		end
+
+		local text = category.label
+		if instance.ObjectText ~= "" then
+			text = text .. " (" .. instance.ObjectText .. ")"
+		end
+
+		local gui, label = createBillboard(adornee, category.color)
+		TangHub.tags[instance] = { gui = gui, label = label, adornee = adornee, key = category.key, text = text, prompt = instance }
+		return
+	end
+
+	if instance:IsA("Model") and MODEL_CATEGORIES[instance.Name] then
+		local category = MODEL_CATEGORIES[instance.Name]
+		local adornee = findRoot(instance)
+		if not adornee then
+			return
+		end
+
+		local gui, label = createBillboard(adornee, category.color)
+		TangHub.tags[instance] = { gui = gui, label = label, adornee = adornee, key = category.key, text = category.label }
+	end
+end
+
+---Scan the workspace without freezing the client.
+function TangHub.scan()
+	local descendants = workspace:GetDescendants()
+	for index, descendant in ipairs(descendants) do
+		if TangHub.detached then
+			return
+		end
+
+		TangHub.register(descendant)
+		if index % 800 == 0 then
+			task.wait()
+		end
+	end
+end
+
+---Create or refresh an ESP entry that follows a character model.
+---@param store table
+---@param owner any
+---@param character Model
+---@param labelText string
+---@param color Color3
+---@return table?
+local function updateCharacterEsp(store, owner, character, labelText, color)
+	local root = findRoot(character)
+	if not root then
+		return nil
+	end
+
+	local entry = store[owner]
+	if not entry then
+		local highlight = Instance.new("Highlight")
+		highlight.FillTransparency = 0.7
+		highlight.OutlineColor = color
+		highlight.FillColor = color
+		highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+		highlight.Parent = espFolder
+
+		local gui, label = createBillboard(root, color)
+		entry = { highlight = highlight, gui = gui, label = label }
+		store[owner] = entry
+	end
+
+	entry.highlight.Adornee = character
+	entry.gui.Adornee = root
+	entry.label.Text = labelText
+	entry.root = root
+	return entry
+end
+
+---Hide an ESP entry without destroying it.
+---@param entry table?
+local function hideEntry(entry)
+	if not entry then
+		return
+	end
+
+	entry.highlight.Enabled = false
+	entry.gui.Enabled = false
+end
+
+---Show an ESP entry.
+---@param entry table
+local function showEntry(entry)
+	entry.highlight.Enabled = true
+	entry.gui.Enabled = true
+end
+
+---Update ghost ESP and proximity alert.
+---@param origin Vector3
+function TangHub.updateGhost(origin)
+	local ghost = workspace:FindFirstChild("Ghost")
+	local entry = TangHub.ghostEntry
+
+	if not ghost or not ghost:IsA("Model") then
+		hideEntry(entry)
+		return
+	end
+
+	local root = findRoot(ghost)
+	if not root then
+		hideEntry(entry)
+		return
+	end
+
+	local distance = (root.Position - origin).Magnitude
+
+	if TangHub.enabled.ghost then
+		local holder = { ghost = TangHub.ghostEntry }
+		TangHub.ghostEntry = updateCharacterEsp(holder, "ghost", ghost, string.format("ผี [%dm]", distance), GHOST_COLOR)
+		if TangHub.ghostEntry then
+			showEntry(TangHub.ghostEntry)
+		end
+	else
+		hideEntry(entry)
+	end
+
+	if TangHub.ghostAlert and distance <= TangHub.alertDistance and os.clock() - TangHub.lastAlert > 5 then
+		TangHub.lastAlert = os.clock()
+		if TangHub.window then
+			TangHub.window:notify({ Title = "ระวัง!", Text = string.format("ผีอยู่ห่างแค่ %d เมตร", distance), Duration = 3 })
+		end
+	end
+end
+
+---Update other players ESP.
+function TangHub.updatePlayers()
+	for _, player in ipairs(playersService:GetPlayers()) do
+		if player == localPlayer then
+			continue
+		end
+
+		local entry = TangHub.playerTags[player]
+		local character = player.Character
+		if not (TangHub.enabled.players and character) then
+			hideEntry(entry)
+			continue
+		end
+
+		entry = updateCharacterEsp(TangHub.playerTags, player, character, player.DisplayName, PLAYER_COLOR)
+		if entry then
+			showEntry(entry)
+		end
+	end
+end
+
+---Main per-interval update for all object tags.
+---@param origin Vector3
+---@param hrp BasePart?
+function TangHub.updateTags(origin, hrp)
+	for instance, tag in pairs(TangHub.tags) do
+		if not instance:IsDescendantOf(workspace) or not tag.adornee:IsDescendantOf(workspace) then
+			tag.gui:Destroy()
+			TangHub.tags[instance] = nil
+			continue
+		end
+
+		local distance = (tag.adornee.Position - origin).Magnitude
+		local promptAlive = tag.prompt == nil or tag.prompt.Enabled
+		local visible = TangHub.enabled[tag.key] and promptAlive and distance <= TangHub.maxDistance
+
+		tag.gui.Enabled = visible == true
+		if visible then
+			tag.label.Text = string.format("%s [%dm]", tag.text, distance)
+		end
+
+		-- Auto pickup nearby items.
+		local prompt = tag.prompt
+		if TangHub.autoPickup and tag.key == "pickup" and promptAlive and hrp and prompt then
+			local pickupDistance = (tag.adornee.Position - hrp.Position).Magnitude
+			local lastTime = TangHub.pickupTimes[prompt] or 0
+			if pickupDistance <= TangHub.autoPickupRange and os.clock() - lastTime > AUTO_PICKUP_COOLDOWN then
+				TangHub.pickupTimes[prompt] = os.clock()
+				pcall(fireproximityprompt, prompt)
+			end
+		end
+	end
+end
+
+---Apply lighting options.
+function TangHub.updateLighting()
+	if TangHub.fullbright then
+		lightingService.Brightness = 2
+		lightingService.ClockTime = 14
+		lightingService.GlobalShadows = false
+		lightingService.Ambient = Color3.fromRGB(200, 200, 200)
+	end
+
+	if TangHub.noFog then
+		lightingService.FogStart = 0
+		lightingService.FogEnd = 1e9
+	end
+end
+
+---Restore lighting to the original values.
+function TangHub.restoreLighting()
+	for property, value in pairs(originalLighting) do
+		lightingService[property] = value
+	end
+end
+
+---Keep the game's own InfStamina flag set (PlayerControls reads it every frame).
+function TangHub.updateStamina()
+	if TangHub.infStamina then
+		if localPlayer:GetAttribute("InfStamina") ~= true then
+			localPlayer:SetAttribute("InfStamina", true)
+		end
+	end
+end
+
+---Disable collision on every part of the character.
+function TangHub.updateNoclip()
+	if not TangHub.noclip then
+		return
+	end
+
+	local character = localPlayer.Character
+	if not character then
+		return
+	end
+
+	for _, part in ipairs(character:GetDescendants()) do
+		if part:IsA("BasePart") and part.CanCollide then
+			TangHub.noclipParts[part] = true
+			part.CanCollide = false
+		end
+	end
+end
+
+---Restore collision on the parts noclip changed.
+function TangHub.restoreNoclip()
+	for part in pairs(TangHub.noclipParts) do
+		if part.Parent then
+			part.CanCollide = true
+		end
+		TangHub.noclipParts[part] = nil
+	end
+end
+
+---Load the game's QuestData module so quests, items and rooms are read exactly as the HUD does.
+function TangHub.loadQuestData()
+	local module = replicatedStorage:FindFirstChild("QuestData")
+	if not module then
+		return
+	end
+
+	-- Drop identity so the game module cannot see our executor environment.
+	if setthreadidentity then
+		setthreadidentity(2)
+	end
+
+	local success, data = pcall(require, module)
+
+	if setthreadidentity then
+		setthreadidentity(8)
+	end
+
+	if success and typeof(data) == "table" then
+		TangHub.questData = data
+	end
+end
+
+---Key colors used by the current game build.
+---@return table
+function TangHub.getKeyColors()
+	local data = TangHub.questData
+	if data and typeof(data.KEY_COLORS) == "table" then
+		return data.KEY_COLORS
+	end
+
+	return DEFAULT_KEY_COLORS
+end
+
+---Count the keys the local player holds.
+---@return number
+function TangHub.countKeys()
+	local count = 0
+
+	for _, color in ipairs(TangHub.getKeyColors()) do
+		if hasKey(color) then
+			count = count + 1
+		end
+	end
+
+	return count
+end
+
+---Get the position of the ghost if it exists.
+---@return Vector3?
+function TangHub.getGhostPosition()
+	local ghost = workspace:FindFirstChild("Ghost")
+	if not ghost or not ghost:IsA("Model") then
+		return nil
+	end
+
+	local root = findRoot(ghost)
+	return root and root.Position or nil
+end
+
+---Check whether a prompt is on cooldown or out of attempts.
+---@param prompt ProximityPrompt
+---@param now number
+---@return boolean
+function TangHub.isCoolingDown(prompt, now)
+	local info = TangHub.attempts[prompt]
+	if not info then
+		return false
+	end
+
+	if now - info.time < PROMPT_RETRY_DELAY then
+		return true
+	end
+
+	return info.count >= MAX_PROMPT_ATTEMPTS and now - info.time < ATTEMPT_RESET
+end
+
+---Collect usable prompts (tagged and unknown) that pass a predicate.
+---@param hrp BasePart
+---@param predicate function
+---@return table
+function TangHub.usablePrompts(hrp, predicate)
+	local now = os.clock()
+	local result = {}
+
+	local function consider(prompt, key)
+		if not (prompt.Enabled and prompt:IsDescendantOf(workspace)) then
+			return
+		end
+
+		if TangHub.isCoolingDown(prompt, now) then
+			return
+		end
+
+		if not predicate(prompt, key) then
+			return
+		end
+
+		local position = getPromptPosition(prompt)
+		if not position then
+			return
+		end
+
+		table.insert(result, { prompt = prompt, position = position, distance = (position - hrp.Position).Magnitude })
+	end
+
+	for _, tag in pairs(TangHub.tags) do
+		if tag.prompt then
+			consider(tag.prompt, tag.key)
+		end
+	end
+
+	for prompt in pairs(TangHub.otherPrompts) do
+		consider(prompt, "other")
+	end
+
+	return result
+end
+
+---Choose the nearest prompt, preferring ones away from the ghost.
+---@param list table
+---@return ProximityPrompt?
+function TangHub.chooseNearest(list)
+	if #list == 0 then
+		return nil
+	end
+
+	table.sort(list, function(a, b)
+		return a.distance < b.distance
+	end)
+
+	local ghostPosition = TangHub.ghostAvoid and TangHub.getGhostPosition() or nil
+	if not ghostPosition then
+		return list[1].prompt
+	end
+
+	for _, entry in ipairs(list) do
+		if (entry.position - ghostPosition).Magnitude > GHOST_SAFE_DISTANCE then
+			TangHub.unsafeSince = nil
+			return entry.prompt
+		end
+	end
+
+	-- Every target is near the ghost, wait a while and then go anyway.
+	TangHub.unsafeSince = TangHub.unsafeSince or os.clock()
+	if os.clock() - TangHub.unsafeSince > GHOST_WAIT_LIMIT then
+		TangHub.unsafeSince = nil
+		return list[1].prompt
+	end
+
+	return nil
+end
+
+---Find a single prompt by ESP category key.
+---@param key string
+---@param pathHint string?
+---@return ProximityPrompt?
+function TangHub.findPrompt(key, pathHint)
+	local now = os.clock()
+	local fallback = nil
+
+	for _, tag in pairs(TangHub.tags) do
+		local prompt = tag.prompt
+		if prompt and tag.key == key and prompt.Enabled and prompt:IsDescendantOf(workspace) then
+			if TangHub.isCoolingDown(prompt, now) then
+				continue
+			end
+
+			if pathHint and prompt:GetFullName():find(pathHint, 1, true) then
+				return prompt
+			end
+			fallback = fallback or prompt
+		end
+	end
+
+	return fallback
+end
+
+---Read the active quests the same way the HUD does.
+---@return table
+function TangHub.questState()
+	local state = { items = {}, lockedRooms = {}, missingKey = false, pending = 0 }
+	local data = TangHub.questData
+	if not data or typeof(data.quest) ~= "function" then
+		return state
+	end
+
+	-- Items the player is carrying right now.
+	local carried = {}
+	for name in string.gmatch(localPlayer:GetAttribute("Items") or "", "[^,]+") do
+		carried[string.lower(name)] = true
+	end
+
+	for id in string.gmatch(workspace:GetAttribute("Quests") or "", "[^,]+") do
+		local success, quest = pcall(data.quest, id)
+		if not (success and quest) or workspace:GetAttribute("Quest_" .. tostring(quest.id)) then
+			continue
+		end
+
+		state.pending = state.pending + 1
+
+		-- Locked room: unlock it if we have the key, otherwise go find one.
+		local room = data.ROOMS and data.ROOMS[quest.room]
+		if room and workspace:GetAttribute("RoomLocked_" .. tostring(quest.room)) == true then
+			if hasKey(room.key) then
+				state.lockedRooms[quest.room] = true
+			else
+				state.missingKey = true
+			end
+		end
+
+		-- Item the quest needs that we do not hold yet.
+		if quest.item and not carried[string.lower(tostring(quest.item))] then
+			state.items[string.lower(tostring(quest.item))] = true
+		end
+	end
+
+	return state
+end
+
+---Check whether a door prompt belongs to a room.
+---@param prompt ProximityPrompt
+---@param room string
+---@return boolean
+local function doorMatchesRoom(prompt, room)
+	local model = prompt:FindFirstAncestorWhichIsA("Model")
+	if not model then
+		return false
+	end
+
+	if string.find(string.lower(model.Name), string.lower(tostring(room)), 1, true) then
+		return true
+	end
+
+	return model:FindFirstChild("Padlock") ~= nil
+end
+
+---Check whether an uncolored or colored lock can be opened right now.
+---@param prompt ProximityPrompt
+---@param searchesLeft boolean
+---@return boolean
+local function lockReady(prompt, searchesLeft)
+	local names = getAncestorNames(prompt) .. " " .. string.lower(prompt.Name)
+	local colors = TangHub.getKeyColors()
+	local colored = false
+
+	for _, color in ipairs(colors) do
+		if string.find(names, string.lower(color), 1, true) then
+			colored = true
+			if hasKey(color) and workspace:GetAttribute(color .. "Unlocked") ~= true then
+				return true
+			end
+		end
+	end
+
+	if colored then
+		return false
+	end
+
+	-- Single gate lock: wait for every key unless there is nothing left to search.
+	local held = TangHub.countKeys()
+	return held >= #colors or (held > 0 and not searchesLeft)
+end
+
+---Pick the next prompt in keys mode (search drawers, open the locks).
+---@param hrp BasePart
+---@return ProximityPrompt?
+function TangHub.pickKeysTarget(hrp)
+	local searches = TangHub.usablePrompts(hrp, function(_, key)
+		return key == "search"
+	end)
+
+	local locks = TangHub.usablePrompts(hrp, function(prompt, key)
+		if not (key == "lock" or isLockPrompt(prompt)) then
+			return false
+		end
+
+		return lockReady(prompt, #searches > 0)
+	end)
+
+	return TangHub.chooseNearest(locks) or TangHub.chooseNearest(searches) or TangHub.pickAnything(hrp)
+end
+
+---Pick the next prompt in quest mode (rooms, items, quest sites).
+---@param hrp BasePart
+---@return ProximityPrompt?
+function TangHub.pickQuestTarget(hrp)
+	local state = TangHub.questState()
+	local target = nil
+
+	-- Open locked rooms we already hold the key for.
+	if next(state.lockedRooms) then
+		target = TangHub.chooseNearest(TangHub.usablePrompts(hrp, function(prompt, key)
+			if key ~= "door" then
+				return false
+			end
+
+			for room in pairs(state.lockedRooms) do
+				if doorMatchesRoom(prompt, room) then
+					return true
+				end
+			end
+
+			return false
+		end))
+
+		if target then
+			return target
+		end
+	end
+
+	-- Fetch the items the active quests ask for.
+	if next(state.items) then
+		target = TangHub.chooseNearest(TangHub.usablePrompts(hrp, function(prompt, key)
+			if key ~= "pickup" then
+				return false
+			end
+
+			local model = prompt:FindFirstAncestorWhichIsA("Model")
+			return model ~= nil and state.items[string.lower(model.Name)] == true
+		end))
+
+		if target then
+			return target
+		end
+	end
+
+	-- Missing items or keys can come from drawers.
+	if state.missingKey or next(state.items) then
+		target = TangHub.chooseNearest(TangHub.usablePrompts(hrp, function(_, key)
+			return key == "search"
+		end))
+
+		if target then
+			return target
+		end
+	end
+
+	-- Quest sites (repair minigames, valves, fuse boxes).
+	target = TangHub.chooseNearest(TangHub.usablePrompts(hrp, function(prompt, key)
+		if key == "quest" or key == "turn" then
+			return true
+		end
+
+		if key == "repair" then
+			return not isGeneratorPrompt(prompt) or workspace:GetAttribute("PowerOn") == false
+		end
+
+		return false
+	end))
+
+	if target then
+		return target
+	end
+
+	-- Last resort: drawers, then loose items.
+	target = TangHub.chooseNearest(TangHub.usablePrompts(hrp, function(_, key)
+		return key == "search"
+	end))
+
+	return target or TangHub.chooseNearest(TangHub.usablePrompts(hrp, function(_, key)
+		return key == "pickup"
+	end)) or TangHub.pickAnything(hrp)
+end
+
+---Pick any harmless prompt as a fallback.
+---@param hrp BasePart
+---@return ProximityPrompt?
+function TangHub.pickAnything(hrp)
+	return TangHub.chooseNearest(TangHub.usablePrompts(hrp, function(prompt, key)
+		if TASK_BLACKLIST[key] then
+			return false
+		end
+
+		return not isGeneratorPrompt(prompt) or workspace:GetAttribute("PowerOn") == false
+	end))
+end
+
+---Teleport next to a prompt and trigger it.
+---@param prompt ProximityPrompt
+---@param hrp BasePart
+---@param ignoreAttempts boolean?
+function TangHub.interact(prompt, hrp, ignoreAttempts)
+	local position = getPromptPosition(prompt)
+	if not position then
+		return
+	end
+
+	TangHub.lastAction = os.clock()
+	prompt.RequiresLineOfSight = false
+
+	hrp.CFrame = CFrame.new(position + Vector3.new(0, 2.5, 0))
+	hrp.AssemblyLinearVelocity = Vector3.zero
+	task.wait(0.25)
+
+	if TangHub.instantPrompt == false and prompt.HoldDuration > 0 then
+		prompt.HoldDuration = 0
+	end
+
+	pcall(fireproximityprompt, prompt)
+
+	if ignoreAttempts then
+		return
+	end
+
+	local info = TangHub.attempts[prompt]
+	if info and os.clock() - info.time < ATTEMPT_RESET then
+		info.count = info.count + 1
+		info.time = os.clock()
+	else
+		TangHub.attempts[prompt] = { count = 1, time = os.clock() }
+	end
+end
+
+---Find the zone that ends the round when touched.
+---@return BasePart?
+function TangHub.findEscapeZone()
+	local zone = TangHub.escapeZone
+	if zone and zone:IsDescendantOf(workspace) then
+		return zone
+	end
+
+	zone = workspace:FindFirstChild("EscapeZone", true)
+	TangHub.escapeZone = zone
+	return zone
+end
+
+---Open the exit and walk into the escape zone.
+---@param hrp BasePart
+function TangHub.escapeStep(hrp)
+	local now = os.clock()
+
+	-- Fire the exit prompt first (once per delay window).
+	local exitPrompt = TangHub.findPrompt("exit")
+	if exitPrompt and now - TangHub.exitFiredAt > EXIT_REFIRE_DELAY then
+		TangHub.exitFiredAt = now
+		TangHub.interact(exitPrompt, hrp, true)
+		return
+	end
+
+	-- Then stand inside the escape zone until the game marks us as escaped.
+	local zone = TangHub.findEscapeZone()
+	if not zone then
+		return
+	end
+
+	TangHub.lastAction = now
+	hrp.CFrame = zone.CFrame
+	hrp.AssemblyLinearVelocity = Vector3.zero
+	pcall(firetouchinterest, hrp, zone, 0)
+	task.wait()
+	pcall(firetouchinterest, hrp, zone, 1)
+end
+
+---One step of the auto finish state machine (follows the game's objective order).
+function TangHub.autoFinishStep()
+	if localPlayer:GetAttribute("Escaped") then
+		if not TangHub.escapedNotified then
+			TangHub.escapedNotified = true
+			if TangHub.window then
+				TangHub.window:notify({ Title = "Tang Hub", Text = "ออกจากด่านสำเร็จ!", Duration = 5 })
+			end
+		end
+		return
+	end
+	TangHub.escapedNotified = false
+
+	if localPlayer:GetAttribute("Defeated") or localPlayer:GetAttribute("Spectating") then
+		return
+	end
+
+	-- A repair minigame is running, wait for it to finish.
+	if TangHub.questActive then
+		return
+	end
+
+	local character = localPlayer.Character
+	local hrp = character and character:FindFirstChild("HumanoidRootPart")
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if not (hrp and humanoid and humanoid.Health > 0) or hrp.Anchored then
+		return
+	end
+
+	-- Nothing happened for a long time, forget failed attempts and retry.
+	if os.clock() - TangHub.lastAction > STUCK_RESET then
+		TangHub.lastAction = os.clock()
+		table.clear(TangHub.attempts)
+	end
+
+	local target = nil
+
+	-- Blackout: restart the generator first.
+	if workspace:GetAttribute("PowerOn") == false then
+		target = TangHub.findPrompt("repair", "GeneratorRoom")
+		if target then
+			return TangHub.interact(target, hrp)
+		end
+	end
+
+	-- Gate is open: leave the level.
+	if workspace:GetAttribute("ExitOpen") then
+		return TangHub.escapeStep(hrp)
+	end
+
+	-- Everything is done, pull the release lever.
+	if workspace:GetAttribute("LeverArmed") then
+		target = TangHub.findPrompt("lever")
+		if target then
+			return TangHub.interact(target, hrp)
+		end
+
+		return TangHub.escapeStep(hrp)
+	end
+
+	if workspace:GetAttribute("ObjectiveMode") == "Keys" then
+		target = TangHub.pickKeysTarget(hrp)
+	else
+		target = TangHub.pickQuestTarget(hrp)
+	end
+
+	if target then
+		TangHub.interact(target, hrp)
+	end
+end
+
+---Background loop running the auto finish.
+function TangHub.autoFinishLoop()
+	while not TangHub.detached do
+		if TangHub.autoFinish then
+			local success, failure = pcall(TangHub.autoFinishStep)
+			if not success then
+				warn(failure)
+			end
+		end
+
+		task.wait(AUTO_STEP_DELAY)
+	end
+end
+
+---Handle QuestGame events and solve the timing minigame.
+---@param action string
+---@param questId string
+function TangHub.onQuestEvent(action, questId)
+	if not (TangHub.autoFinish or TangHub.autoMinigame) then
+		return
+	end
+
+	if action == "start" then
+		TangHub.questActive = questId
+		TangHub.questUpdated = os.clock()
+
+		task.spawn(function()
+			while TangHub.questActive == questId and not TangHub.detached do
+				if os.clock() - TangHub.questUpdated > MINIGAME_TIMEOUT then
+					break
+				end
+
+				task.wait(MINIGAME_PRESS_DELAY)
+				TangHub.questRemote:FireServer("press", questId, true)
+			end
+
+			if TangHub.questActive == questId then
+				TangHub.questActive = nil
+			end
+		end)
+		return
+	end
+
+	if action == "progress" and questId == TangHub.questActive then
+		TangHub.questUpdated = os.clock()
+		return
+	end
+
+	if action == "done" and questId == TangHub.questActive then
+		TangHub.questActive = nil
+	end
+end
+
+---Unload the script completely.
+function TangHub.detach()
+	if TangHub.detached then
+		return
+	end
+	TangHub.detached = true
+
+	for _, connection in ipairs(TangHub.connections) do
+		connection:Disconnect()
+	end
+
+	TangHub.instantPrompt = false
+	TangHub.reachMultiplier = 1
+	TangHub.applyAllPrompts()
+	TangHub.restoreLighting()
+	TangHub.restoreNoclip()
+
+	if TangHub.infStamina then
+		localPlayer:SetAttribute("InfStamina", nil)
+	end
+
+	espFolder:Destroy()
+
+	if TangHub.window then
+		TangHub.window:destroy()
+	end
+end
+
+---Build the Thai menu.
+---@param Library table
+function TangHub.buildMenu(Library)
+	local window = Library.new({ Title = "Tang Hub" })
+	TangHub.window = window
+
+	-- ESP tab.
+	local espTab = window:addTab({ Name = "ESP แมพ" })
+	espTab:addSection("เปิด / ปิดทั้งหมด")
+	espTab:addButton({
+		Name = "เปิด ESP ทั้งหมด",
+		Callback = function()
+			for _, row in ipairs(ESP_TOGGLES) do
+				TangHub.enabled[row.key] = true
+				TangHub.toggles[row.key].Set(true)
+			end
+		end,
+	})
+	espTab:addButton({
+		Name = "ปิด ESP ทั้งหมด",
+		Style = "Destructive",
+		Callback = function()
+			for _, row in ipairs(ESP_TOGGLES) do
+				TangHub.enabled[row.key] = false
+				TangHub.toggles[row.key].Set(false)
+			end
+		end,
+	})
+
+	espTab:addSection("วัตถุในแมพ")
+	for _, row in ipairs(ESP_TOGGLES) do
+		TangHub.enabled[row.key] = row.default
+		TangHub.toggles[row.key] = espTab:addToggle({
+			Name = row.name,
+			Default = row.default,
+			Callback = function(state)
+				TangHub.enabled[row.key] = state
+			end,
+		})
+	end
+
+	espTab:addSection("ตั้งค่า")
+	espTab:addSlider({
+		Name = "ระยะแสดงสูงสุด",
+		Min = 50,
+		Max = 2000,
+		Increment = 50,
+		Default = TangHub.maxDistance,
+		Callback = function(value)
+			TangHub.maxDistance = value
+		end,
+	})
+
+	-- Ghost and players tab.
+	local ghostTab = window:addTab({ Name = "ผี & ผู้เล่น" })
+	ghostTab:addSection("ผี")
+	TangHub.enabled.ghost = true
+	ghostTab:addToggle({
+		Name = "ESP ผี",
+		Default = true,
+		Callback = function(state)
+			TangHub.enabled.ghost = state
+		end,
+	})
+	ghostTab:addToggle({
+		Name = "แจ้งเตือนเมื่อผีเข้าใกล้",
+		Callback = function(state)
+			TangHub.ghostAlert = state
+		end,
+	})
+	ghostTab:addSlider({
+		Name = "ระยะแจ้งเตือน",
+		Min = 10,
+		Max = 150,
+		Increment = 5,
+		Default = TangHub.alertDistance,
+		Callback = function(value)
+			TangHub.alertDistance = value
+		end,
+	})
+	ghostTab:addSection("ผู้เล่น")
+	TangHub.enabled.players = false
+	ghostTab:addToggle({
+		Name = "ESP ผู้เล่นคนอื่น",
+		Callback = function(state)
+			TangHub.enabled.players = state
+		end,
+	})
+
+	-- Movement and auto tab.
+	local autoTab = window:addTab({ Name = "ออโต้ & วิ่ง" })
+	autoTab:addSection("การเคลื่อนไหว")
+	autoTab:addToggle({
+		Name = "วิ่งไม่จำกัด (สตามินาไม่หมด)",
+		Callback = function(state)
+			TangHub.infStamina = state
+			if state then
+				TangHub.updateStamina()
+			else
+				localPlayer:SetAttribute("InfStamina", nil)
+			end
+		end,
+	})
+	autoTab:addToggle({
+		Name = "วิ่งทะลุ (Noclip)",
+		Callback = function(state)
+			TangHub.noclip = state
+			if not state then
+				TangHub.restoreNoclip()
+			end
+		end,
+	})
+
+	autoTab:addSection("ออโต้")
+	autoTab:addToggle({
+		Name = "ออโต้จบด่าน (ทำครบแล้วออกประตู)",
+		Callback = function(state)
+			TangHub.autoFinish = state
+			TangHub.lastAction = os.clock()
+			if not state then
+				TangHub.questActive = nil
+			end
+		end,
+	})
+	autoTab:addToggle({
+		Name = "หลบผีตอนออโต้ (รอถ้าผีอยู่ใกล้เป้าหมาย)",
+		Default = true,
+		Callback = function(state)
+			TangHub.ghostAvoid = state
+		end,
+	})
+	autoTab:addToggle({
+		Name = "ออโต้มินิเกมซ่อม (กดเอง)",
+		Callback = function(state)
+			TangHub.autoMinigame = state
+		end,
+	})
+
+	-- Misc tab.
+	local miscTab = window:addTab({ Name = "ทั่วไป" })
+	miscTab:addSection("การมองเห็น")
+	miscTab:addToggle({
+		Name = "สว่างเต็มจอ",
+		Callback = function(state)
+			TangHub.fullbright = state
+			if not state then
+				TangHub.restoreLighting()
+				TangHub.updateLighting()
+			end
+		end,
+	})
+	miscTab:addToggle({
+		Name = "ลบหมอก",
+		Callback = function(state)
+			TangHub.noFog = state
+			if not state then
+				lightingService.FogStart = originalLighting.FogStart
+				lightingService.FogEnd = originalLighting.FogEnd
+			end
+		end,
+	})
+
+	miscTab:addSection("การโต้ตอบ")
+	miscTab:addToggle({
+		Name = "กดปุ่มทันที (ไม่ต้องกดค้าง)",
+		Callback = function(state)
+			TangHub.instantPrompt = state
+			TangHub.applyAllPrompts()
+		end,
+	})
+	miscTab:addSlider({
+		Name = "ขยายระยะกด (เท่า)",
+		Min = 1,
+		Max = 5,
+		Increment = 1,
+		Default = 1,
+		Callback = function(value)
+			TangHub.reachMultiplier = value
+			TangHub.applyAllPrompts()
+		end,
+	})
+	miscTab:addToggle({
+		Name = "เก็บไอเทมอัตโนมัติ",
+		Callback = function(state)
+			TangHub.autoPickup = state
+		end,
+	})
+	miscTab:addSlider({
+		Name = "ระยะเก็บอัตโนมัติ",
+		Min = 5,
+		Max = 40,
+		Increment = 1,
+		Default = TangHub.autoPickupRange,
+		Callback = function(value)
+			TangHub.autoPickupRange = value
+		end,
+	})
+
+	miscTab:addSection("สคริปต์")
+	miscTab:addButton({
+		Name = "ปิดสคริปต์ Tang Hub",
+		Style = "Destructive",
+		Callback = TangHub.detach,
+	})
+
+	window:addSettings()
+	window:addCredits("Tang Hub")
+
+	window:notify({ Title = "Tang Hub", Text = "โหลดสำเร็จ กด RightShift เพื่อซ่อน/แสดงเมนู", Duration = 5 })
+end
+
+---Start scanning and the update loop.
+function TangHub.start()
+	TangHub.lastAction = os.clock()
+	TangHub.loadQuestData()
+
+	task.spawn(TangHub.scan)
+	task.spawn(TangHub.autoFinishLoop)
+
+	-- Hook the repair minigame remote.
+	task.spawn(function()
+		local remotes = replicatedStorage:WaitForChild("HorrorRemotes", 15)
+		local questRemote = remotes and remotes:WaitForChild("QuestGame", 15)
+		if not questRemote or TangHub.detached then
+			return
+		end
+
+		TangHub.questRemote = questRemote
+		table.insert(TangHub.connections, questRemote.OnClientEvent:Connect(TangHub.onQuestEvent))
+	end)
+
+	table.insert(TangHub.connections, workspace.DescendantAdded:Connect(function(descendant)
+		-- Wait a frame so parents and properties are ready.
+		task.defer(TangHub.register, descendant)
+	end))
+
+	table.insert(TangHub.connections, playersService.PlayerRemoving:Connect(function(player)
+		local entry = TangHub.playerTags[player]
+		if entry then
+			entry.highlight:Destroy()
+			entry.gui:Destroy()
+			TangHub.playerTags[player] = nil
+		end
+	end))
+
+	-- Noclip must run every physics step.
+	table.insert(TangHub.connections, runService.Stepped:Connect(TangHub.updateNoclip))
+
+	-- Re-apply the stamina flag after every respawn.
+	table.insert(TangHub.connections, localPlayer.CharacterAdded:Connect(function()
+		TangHub.questActive = nil
+		task.defer(TangHub.updateStamina)
+	end))
+
+	local elapsed = 0
+	table.insert(TangHub.connections, runService.Heartbeat:Connect(function(delta)
+		elapsed = elapsed + delta
+		if elapsed < UPDATE_INTERVAL then
+			return
+		end
+		elapsed = 0
+
+		TangHub.updateStamina()
+
+		local camera = workspace.CurrentCamera
+		if not camera then
+			return
+		end
+
+		local character = localPlayer.Character
+		local hrp = character and character:FindFirstChild("HumanoidRootPart")
+		local origin = camera.CFrame.Position
+
+		TangHub.updateTags(origin, hrp)
+		TangHub.updateGhost(origin)
+		TangHub.updatePlayers()
+		TangHub.updateLighting()
+	end))
+end
+
+---Download and compile the UI library.
+---@return table?
+local function loadLibrary()
+	local response = request({ Url = UI_URL, Method = "GET" })
+	local chunk, compileError = loadstring(response.Body)
+	if not chunk then
+		warn("compile error: " .. tostring(compileError))
+		return nil
+	end
+
+	return chunk()
+end
+
+---Called when initialization errors.
+---@param errorMessage string
+local function onInitializeError(errorMessage)
+	warn("Tang Hub failed to initialize.")
+	warn(errorMessage)
+	warn(debug.traceback())
+	TangHub.detach()
+end
+
+---Entry point.
+local function initializeScript()
+	if not game:IsLoaded() then
+		game.Loaded:Wait()
+	end
+
+	local Library = loadLibrary()
+	if not Library then
+		return TangHub.detach()
+	end
+
+	TangHub.buildMenu(Library)
+	TangHub.start()
+end
+
+-- Detach previous execution.
+if shared.TangHub then
+	pcall(shared.TangHub.detach)
+end
+shared.TangHub = TangHub
+
+xpcall(initializeScript, onInitializeError)
