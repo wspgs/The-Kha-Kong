@@ -104,15 +104,15 @@ local TangHub = {
 	ghostAlert = false,
 	alertDistance = 40,
 	lastAlert = 0,
-	fullbright = false,  -- เปิดสว่างเต็มจอเริ่มต้น
-	noFog = false,       -- เปิดลบหมอกเริ่มต้น
+	fullbright = true,  -- เปิดสว่างเต็มจอเริ่มต้น
+	noFog = true,       -- เปิดลบหมอกเริ่มต้น
 	instantPrompt = false,
 	reachMultiplier = 1,
 	autoPickup = true,
 	autoPickupRange = 14,
 	infStamina = true,  -- เปิดวิ่งไม่จำกัดเริ่มต้น
-	noclip = false,      -- เปิด Noclip เริ่มต้น
-	autoFinish = false,  -- เปิดออโต้จบด่านเริ่มต้น
+	noclip = true,      -- เปิด Noclip เริ่มต้น
+	autoFinish = false, -- ปิดออโต้จบด่านเริ่มต้น (กดเปิดเอง)
 	autoFarm = false,   -- ออโต้ฟาร์มวนลูป (จบแล้วเริ่มใหม่)
 	rejoining = false,
 	autoMinigame = true,
@@ -1493,6 +1493,15 @@ function TangHub.autoFinishStep()
 			end
 		end
 
+		if not TangHub.autoFarm then
+			TangHub.autoFinish = false
+			if TangHub.toggles.autoFinish then
+				TangHub.toggles.autoFinish.Set(false)
+			end
+			TangHub.questActive = nil
+			return
+		end
+
 		if TangHub.autoFarm and not TangHub.rejoining then
 			TangHub.rejoining = true
 			task.spawn(function()
@@ -1511,6 +1520,15 @@ function TangHub.autoFinishStep()
 	TangHub.escapedNotified = false
 
 	if localPlayer:GetAttribute("Defeated") or localPlayer:GetAttribute("Spectating") then
+		if not TangHub.autoFarm then
+			TangHub.autoFinish = false
+			if TangHub.toggles.autoFinish then
+				TangHub.toggles.autoFinish.Set(false)
+			end
+			TangHub.questActive = nil
+			return
+		end
+
 		if TangHub.autoFarm and not TangHub.rejoining then
 			TangHub.rejoining = true
 			task.spawn(function()
@@ -1824,9 +1842,9 @@ function TangHub.buildMenu(Library)
 	})
 
 	autoTab:addSection("ออโต้")
-	autoTab:addToggle({
+	TangHub.toggles.autoFinish = autoTab:addToggle({
 		Name = "ออโต้จบด่าน (ทำครบแล้วออกประตู)",
-		Default = false, -- ตั้งค่า UI เป็นเปิดเริ่มต้น
+		Default = false, -- ปิดเริ่มต้น (ให้กดเปิดเอง)
 		Callback = function(state)
 			TangHub.autoFinish = state
 			TangHub.lastProgress = os.clock()
@@ -1972,12 +1990,29 @@ function TangHub.start()
 	-- Noclip must run every physics step.
 	table.insert(TangHub.connections, runService.Stepped:Connect(TangHub.updateNoclip))
 
-	-- Re-apply the stamina flag after every respawn.
+	-- Re-apply the stamina flag after every respawn and reset auto finish if not farming.
 	table.insert(TangHub.connections, localPlayer.CharacterAdded:Connect(function()
 		TangHub.questActive = nil
 		TangHub.legacyLockPhase = false
 		TangHub.lockTries = 0
+		if not TangHub.autoFarm then
+			TangHub.autoFinish = false
+			if TangHub.toggles.autoFinish then
+				TangHub.toggles.autoFinish.Set(false)
+			end
+		end
 		task.defer(TangHub.updateStamina)
+	end))
+
+	-- Turn off auto finish when escaping.
+	table.insert(TangHub.connections, localPlayer:GetAttributeChangedSignal("Escaped"):Connect(function()
+		if localPlayer:GetAttribute("Escaped") and not TangHub.autoFarm then
+			TangHub.autoFinish = false
+			if TangHub.toggles.autoFinish then
+				TangHub.toggles.autoFinish.Set(false)
+			end
+			TangHub.questActive = nil
+		end
 	end))
 
 	local elapsed = 0
