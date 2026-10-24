@@ -1826,7 +1826,7 @@ function TangHub.buildMenu(Library)
 	autoTab:addSection("ออโต้")
 	autoTab:addToggle({
 		Name = "ออโต้จบด่าน (ทำครบแล้วออกประตู)",
-		Default = true, -- ตั้งค่า UI เป็นเปิดเริ่มต้น
+		Default = false, -- ตั้งค่า UI เป็นเปิดเริ่มต้น
 		Callback = function(state)
 			TangHub.autoFinish = state
 			TangHub.lastProgress = os.clock()
